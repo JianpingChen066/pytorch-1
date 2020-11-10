@@ -638,32 +638,127 @@ SparseTensor& add_out_sparse_cpu(const SparseTensor& t, const SparseTensor& src,
 // add(Tensor, SparseTensor, Scalar)
 //    formerly known as spcadd
 // --------------------------------------------------------------------
-
 template <typename scalar_t>
-void add_dense_sparse_worker_cpu(Tensor& r, const Scalar& value, const SparseTensor& sparse, const Tensor& indices, const Tensor& values) {
+void add_dense_sparse_worker_non_hybrid_cpu(Tensor& r, const Scalar& value, const SparseTensor& sparse, const Tensor& indices, const Tensor& values) {
   auto indices_accessor = indices.accessor<int64_t, 2>();
   auto values_accessor = values.accessor<scalar_t, 1>();
 
   scalar_t* r_ptr = r.data_ptr<scalar_t>();
   scalar_t cast_value = value.to<scalar_t>();
-
+  auto sparse_dim = sparse.sparse_dim();
+  std::vector<int64_t> result_stride(sparse_dim);
+  for (int64_t d = 0; d < sparse_dim; d++) {
+    result_stride[d] = r.stride(d);
+  }
   at::parallel_for(0, sparse._nnz(), 0, [&](int64_t start, int64_t end) {
     for (auto k: c10::irange(start, end)) {
       int64_t index = r.storage_offset();
-      for (auto d: c10::irange(sparse.sparse_dim())) {
-        index += r.stride(d) * indices_accessor[d][k];
+      for (auto d: c10::irange(sparse_dim)) {
+        index += result_stride[d] * indices_accessor[d][k];
       }
       r_ptr[index] += cast_value * values_accessor[k];
     }
   });
 }
 
-Tensor& add_out_dense_sparse_cpu(Tensor& r, const Tensor& dense, const SparseTensor& sparse_, const Scalar& value) {
-  AT_ASSERT(!r.is_sparse());
-  AT_ASSERT(!dense.is_sparse());
-  AT_ASSERT(sparse_.is_sparse());
+template <typename scalar_t>
+inline void add_dense_sparse_worker_hybrid_cpu(Tensor& r, const Scalar& value, const SparseTensor& sparse, const Tensor& indices, const Tensor& values) {
 
-  AT_ASSERT(!dense.is_cuda()); // dispatch argument
+  // Get the dense dimension element numbers of hybrid sparse tensor
+  int64_t values_dense_size = values.stride(0);
+  TORCH_CHECK(values.is_contiguous());
+  scalar_t* v_ptr = values.data_ptr<scalar_t>();
+
+  scalar_t* r_ptr = r.data_ptr<scalar_t>();
+  TORCH_CHECK(r_ptr != nullptr);
+
+  auto indices_accessor = indices.accessor<int64_t, 2>();
+  scalar_t cast_value = value.to<scalar_t>();
+  auto sparse_dim = sparse.sparse_dim();
+  std::vector<int64_t> result_stride(sparse_dim);
+  for (int64_t d = 0; d < sparse_dim; d++) {
+    result_stride[d] = r.stride(d);
+  }
+
+  at::parallel_for(0, sparse._nnz(), 0, [&](int64_t start, int64_t end) {
+    for (auto k: c10::irange(start, end)) {
+      auto r_index = r_ptr;
+      for (auto d: c10::irange(sparse_dim)) {
+        r_index += result_stride[d] * indices_accessor[d][k];
+      }
+      auto v_index = v_ptr + k * values_dense_size;
+      at::native::cpublas::axpy<scalar_t>(values_dense_size, cast_value, v_index, 1, r_index, 1);
+    }
+  });
+}
+
+template <typename scalar_t>
+inline void add_dense_sparse_worker_non_coalesced_cpu(Tensor& r, const Scalar& value,
+    const SparseTensor& sparse, const Tensor& indices, const Tensor& values) {
+
+  // Get the dense dimension element numbers of hybrid sparse tensor
+  auto values_dense_size = values.stride(0);
+  TORCH_CHECK(values.is_contiguous());
+  scalar_t* v_ptr = values.data_ptr<scalar_t>();
+  TORCH_CHECK(v_ptr != nullptr);
+
+  scalar_t* r_ptr = r.data_ptr<scalar_t>();
+  TORCH_CHECK(r_ptr != nullptr);
+
+  scalar_t cast_value = value.to<scalar_t>();
+  auto sparse_dim = sparse.sparse_dim();
+
+  auto indices_accessor = indices.accessor<int64_t, 2>();
+  int64_t result_length = r.size(0);
+  std::vector<int64_t> result_stride(sparse_dim);
+  for (int64_t d = 0; d < sparse_dim; d++) {
+    result_stride[d] = r.stride(d);
+  }
+
+  auto sparse_nnz = sparse._nnz();
+  int max_threads = at::get_num_threads();
+  max_threads = (result_length < max_threads) ? result_length : max_threads;
+  int64_t avg_chunk_down = result_length / max_threads;
+  std::vector<int64_t> chuck_size(max_threads);
+  for (auto i = 0; i < max_threads; i++) {
+    chuck_size[i] = avg_chunk_down;
+  }
+  //make chunk balance among threads as 211
+  for (auto i = 0 ; i < result_length % max_threads ; i++) {
+    chuck_size[i] += 1;
+  }
+  std::vector<int64_t> chuck_sum_size(max_threads + 1);
+  chuck_sum_size[0] = 0;
+  for (auto i = 1; i < max_threads; i++) {
+    chuck_sum_size[i] = chuck_sum_size[i - 1] + chuck_size[i - 1];
+  }
+  chuck_sum_size[max_threads] = result_length;
+  at::parallel_for(0, max_threads, 0, [&](int64_t start, int64_t end) {
+    for (auto k: c10::irange(start, end)) {
+      int64_t chunk_begin = chuck_sum_size[k];
+      int64_t chunk_end = chuck_sum_size[k + 1];
+      for (int64_t n = 0; n < sparse_nnz; n++) {
+        int64_t chunk_offset = indices_accessor[0][n];
+        if (chunk_offset >= chunk_begin && chunk_offset < chunk_end) {
+          int64_t r_offset = result_stride[0] * chunk_offset;
+          for (int64_t d = 1; d < sparse_dim; d++) {
+            r_offset += result_stride[d] * indices_accessor[d][n];
+          }
+          scalar_t* v_index = v_ptr + n * values_dense_size;
+          auto r_index = r_ptr + r_offset;
+          at::native::cpublas::axpy<scalar_t>(values_dense_size, cast_value, v_index, 1, r_index, 1);
+        }
+      }
+    }
+  });
+}
+
+Tensor& add_out_dense_sparse_cpu(Tensor& r, const Tensor& dense, const SparseTensor& sparse_, const Scalar& value) {
+  TORCH_CHECK(!r.is_sparse());
+  TORCH_CHECK(!dense.is_sparse());
+  TORCH_CHECK(sparse_.is_sparse());
+
+  TORCH_CHECK(!dense.is_cuda()); // dispatch argument
   TORCH_CHECK(!r.is_cuda(), "add: expected 'out' to be CPU tensor, but got CUDA tensor");
   TORCH_CHECK(!sparse_.is_cuda(), "add: expected 'other' to be a CPU tensor, but got a CUDA tensor");
 
@@ -674,19 +769,15 @@ Tensor& add_out_dense_sparse_cpu(Tensor& r, const Tensor& dense, const SparseTen
   TORCH_CHECK(canCast(commonDtype, r.scalar_type()), "Can't convert result type ", commonDtype, " to output ", r.scalar_type(), " in add operation");
 
   r.resize_as_(dense);
-  SparseTensor sparse = sparse_.coalesce();
 
-  Tensor indices = sparse._indices();
-  Tensor values = sparse._values();
-  int64_t nDim = dense.dim();
-  int64_t nDimI = sparse.sparse_dim();
-
-  if (sparse._nnz() == 0) {
+  auto sparse_nnz = sparse_._nnz();
+  if (sparse_nnz == 0) {
     if (!is_same_tensor(r, dense)) r.copy_(dense);
     return r;
   }
 
-  Tensor valuesBuffer = values.to(commonDtype);
+  int64_t dense_dim = dense.dim();
+  int64_t sparse_dim = sparse_.sparse_dim();
   Tensor resultBuffer = r;
   if (r.scalar_type() != commonDtype) {
     resultBuffer = dense.to(commonDtype);
@@ -694,22 +785,54 @@ Tensor& add_out_dense_sparse_cpu(Tensor& r, const Tensor& dense, const SparseTen
     resultBuffer.copy_(dense);
   }
 
-  // accessors rely on nnz test
-  if (nDim > nDimI) {
-    auto indices_accessor = indices.accessor<int64_t, 2>();
-    for (int64_t k = 0; k < sparse._nnz(); k++) {
-      Tensor dstBuffer = resultBuffer;
-      for (int64_t d = 0; d < sparse.sparse_dim(); d++) {
-        dstBuffer = dstBuffer.select(0, indices_accessor[d][k]);
-      }
-      Tensor srcBuffer = valuesBuffer.select(0, k);
-      dstBuffer.add_(srcBuffer, value);
+  Tensor values = sparse_._values();
+  bool sparse_is_coalesced = (sparse_.is_coalesced() || sparse_nnz == 1);
+  bool result_is_contiguous = ((r.storage().data() != nullptr) && resultBuffer.is_contiguous());
+  bool value_is_contiguous = values.is_contiguous();
+  bool is_contiguous =  (result_is_contiguous && value_is_contiguous);
+
+  if (is_contiguous && sparse_is_coalesced) {
+    Tensor indices = sparse_._indices();
+    //TODO: we can optimize it for non-hybrid by not using buffers
+    Tensor valuesBuffer = values.to(commonDtype);
+    if (sparse_dim == dense_dim) {
+      AT_DISPATCH_ALL_TYPES_AND_COMPLEX_AND(at::ScalarType::Bool,
+          commonDtype, "add_dense_sparse_non_hybrid", [&] {
+            add_dense_sparse_worker_non_hybrid_cpu<scalar_t>(resultBuffer, value, sparse_, indices, valuesBuffer);
+          });
+    } else {
+      AT_DISPATCH_ALL_TYPES_AND_COMPLEX(
+          commonDtype, "add_dense_sparse_hybrid", [&] {
+            add_dense_sparse_worker_hybrid_cpu<scalar_t>(resultBuffer, value, sparse_, indices, valuesBuffer);
+          });
     }
-  } else {
-    AT_DISPATCH_ALL_TYPES_AND_COMPLEX_AND(at::ScalarType::Bool,
-        commonDtype, "add_dense_sparse", [&] {
-          add_dense_sparse_worker_cpu<scalar_t>(resultBuffer, value, sparse, indices, valuesBuffer);
+  } else if (is_contiguous && (sparse_dim > 0)) {
+    // Handle sparse is not coalesced
+    Tensor indices = sparse_._indices();
+    Tensor valuesBuffer = values.to(commonDtype);
+    AT_DISPATCH_ALL_TYPES_AND_COMPLEX(
+        commonDtype, "add_dense_sparse_worker_non_coalesced", [&] {
+          add_dense_sparse_worker_non_coalesced_cpu<scalar_t>(resultBuffer, value, sparse_, indices, valuesBuffer);
         });
+  } else {
+    // Slow path for non-contiguous values and output
+    // TODO: coalesce() performance may can be further improved
+    SparseTensor sparse = sparse_.coalesce();
+    Tensor indices = sparse._indices();
+    values = sparse._values();
+    Tensor valuesBuffer = values.to(commonDtype);
+    auto indices_accessor = indices.accessor<int64_t, 2>();
+    auto sparse_nnz = sparse._nnz();
+    at::parallel_for(0, sparse_nnz, 100, [&](int64_t start, int64_t end) {
+      for (auto k: c10::irange(start, end)) {
+        Tensor dstBuffer = resultBuffer;
+        for (auto d: c10::irange(sparse_dim)) {
+          dstBuffer = dstBuffer.select(0, indices_accessor[d][k]);
+        }
+        Tensor srcBuffer = valuesBuffer.select(0, k);
+        dstBuffer.add_(srcBuffer, value);
+      }
+    });
   }
   if (r.scalar_type() != commonDtype) {
     r.copy_(resultBuffer);
